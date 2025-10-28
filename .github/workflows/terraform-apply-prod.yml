@@ -1,0 +1,37 @@
+name: Deploy to Production
+
+on:
+  workflow_dispatch:  # Manual trigger
+  push:
+    branches:
+      - main
+    paths:
+      - 'terraform/environments/prod/**'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production  # GitHub environment with protection rules
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_PROD }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_PROD }}
+      
+      - uses: hashicorp/setup-terraform@v3
+      
+      - name: Terraform Init
+        working-directory: terraform/environments/prod
+        run: terraform init
+      
+      - name: Terraform Apply
+        working-directory: terraform/environments/prod
+        run: terraform apply -auto-approve
