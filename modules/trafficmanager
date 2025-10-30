@@ -1,0 +1,104 @@
+variable "environment" { type = string }
+variable "project_name" { type = string }
+variable "resource_group_name" { type = string }
+variable "tags" { type = map(string) }
+variable "regional_endpoints" {
+  type = map(object({
+    target_resource_id = string
+    priority           = number
+    location           = string
+  }))
+}
+variable "traffic_routing_method" { type = string }
+variable "monitor_protocol" { type = string }
+variable "monitor_port" { type = number }
+variable "monitor_path" { type = string }
+
+locals {
+  traffic_manager_profile_name = "tm-${var.project_name}-${var.environment}-global"
+}
+
+# Traffic Manager Profile
+resource "azurerm_traffic_manager_profile" "main" {
+  name                   = local.traffic_manager_profile_name
+  resource_group_name    = var.resource_group_name
+  traffic_routing_method = var.traffic_routing_method
+  
+  dns_config {
+    relative_name = "${var.project_name}-${var.environment}"
+    ttl           = 60
+  }
+
+  monitor_config {
+    protocol                     = var.monitor_protocol
+    port                         = var.monitor_port
+    path                         = var.monitor_path
+    interval_in_seconds          = 30
+    timeout_in_seconds           = 10
+    tolerated_number_of_failures = 3
+    
+    expected_status_code_ranges = ["200-299", "301-302"]
+  }
+
+  tags = var.tags
+}
+
+# Traffic Manager Endpoints (one per region)
+resource "azurerm_traffic_manager_azure_endpoint" "regional" {
+  for_each = var.regional_endpoints
+
+  name               = "endpoint-${each.key}"
+  profile_id         = azurerm_traffic_manager_profile.main.id
+  target_resource_id = each.value.target_resource_id
+  priority           = each.value.priority
+  weight             = 100
+  
+  # Enable/disable endpoint based on health probes
+  enabled = true
+  
+  # Geo-mapping can be added for Geographic routing
+  # geo_mappings = []
+}
+
+# Diagnostic settings for Traffic Manager
+resource "azurerm_monitor_diagnostic_setting" "traffic_manager" {
+  name               = "diag-${local.traffic_manager_profile_name}"
+  target_resource_id = azurerm_traffic_manager_profile.main.id
+  
+  # Note: Traffic Manager requires a storage account for diagnostics
+  # Alternatively, you can use Log Analytics workspace
+  # log_analytics_workspace_id = var.log_analytics_workspace_id
+
+  enabled_log {
+    category = "ProbeHealthStatusEvents"
+  }
+
+  metric {
+    category = "AllMetrics"
+    enabled  = true
+  }
+}
+
+# Outputs
+output "traffic_manager_profile_id" {
+  value = azurerm_traffic_manager_profile.main.id
+}
+
+output "traffic_manager_profile_name" {
+  value = azurerm_traffic_manager_profile.main.name
+}
+
+output "traffic_manager_fqdn" {
+  value       = azurerm_traffic_manager_profile.main.fqdn
+  description = "The fully qualified domain name (FQDN) of the Traffic Manager profile"
+}
+
+output "traffic_manager_endpoints" {
+  value = {
+    for key, endpoint in azurerm_traffic_manager_azure_endpoint.regional : key => {
+      name     = endpoint.name
+      priority = endpoint.priority
+      enabled  = endpoint.enabled
+    }
+  }
+}
