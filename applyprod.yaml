@@ -1,0 +1,132 @@
+name: Terraform Apply - Production
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'terraform/environments/prod/**'
+      - 'terraform/modules/**'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+jobs:
+  apply-prod:
+    name: Apply to Production
+    runs-on: ubuntu-latest
+    environment: 
+      name: production
+      # Requires manual approval in GitHub environment settings
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.7
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_PROD }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_PROD }}
+
+      - name: Terraform Init
+        working-directory: terraform/environments/prod
+        run: terraform init
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: terraform/environments/prod
+        run: |
+          terraform plan -out=tfplan
+          terraform show -no-color tfplan > plan.txt
+
+      - name: Create Plan Summary
+        run: |
+          echo "## Production Deployment Plan" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```terraform' >> $GITHUB_STEP_SUMMARY
+          head -n 100 terraform/environments/prod/plan.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Terraform Apply
+        working-directory: terraform/environments/prod
+        run: terraform apply -auto-approve tfplan
+
+      - name: Output Infrastructure Details
+        id: outputs
+        working-directory: terraform/environments/prod
+        run: |
+          echo "## Production Infrastructure Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          terraform output -json | jq -r 'to_entries[] | "- **\(.key)**: \(.value.value)"' >> $GITHUB_STEP_SUMMARY
+          
+          # Save outputs for downstream jobs
+          terraform output -json > outputs.json
+
+      - name: Upload Outputs
+        uses: actions/upload-artifact@v3
+        with:
+          name: terraform-outputs
+          path: terraform/environments/prod/outputs.json
+          retention-days: 30
+
+      - name: Run Post-Deployment Validation
+        run: |
+          echo "Running production validation tests..."
+          # Add comprehensive validation tests here
+          # - Health checks
+          # - Connectivity tests
+          # - Security validation
+
+      - name: Create Deployment Record
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const outputs = JSON.parse(fs.readFileSync('terraform/environments/prod/outputs.json', 'utf8'));
+            
+            github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+              environment: 'production',
+              description: 'Production infrastructure deployment',
+              auto_merge: false,
+              required_contexts: []
+            });
+
+      - name: Notify on Success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'Production Infrastructure Deployed Successfully',
+              body: `Production infrastructure has been deployed successfully.\n\nDeployment: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nCommit: ${context.sha}`,
+              labels: ['infrastructure', 'production', 'deployment']
+            });
+
+      - name: Notify on Failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '🚨 CRITICAL: Production Terraform Apply Failed',
+              body: `**CRITICAL**: The Terraform apply to production has failed. Immediate action required.\n\nLogs: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\n@ops-team @security-team`,
+              labels: ['infrastructure', 'production', 'failed-deployment', 'critical'],
+              assignees: ['ops-lead'] // Replace with actual GitHub usernames
+            });
