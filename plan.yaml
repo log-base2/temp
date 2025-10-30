@@ -1,23 +1,24 @@
-name: Terraform Apply - Dev
+name: Terraform Apply - Staging
 
 on:
   push:
     branches:
       - main
     paths:
-      - 'terraform/environments/dev/**'
+      - 'terraform/environments/staging/**'
       - 'terraform/modules/**'
   workflow_dispatch:
 
 permissions:
   id-token: write
   contents: read
+  issues: write
 
 jobs:
-  apply-dev:
-    name: Apply to Development
+  apply-staging:
+    name: Apply to Staging
     runs-on: ubuntu-latest
-    environment: development
+    environment: staging
     
     steps:
       - name: Checkout
@@ -31,29 +32,34 @@ jobs:
       - name: Azure Login
         uses: azure/login@v1
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID_DEV }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID_STAGING }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_DEV }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_STAGING }}
 
       - name: Terraform Init
-        working-directory: terraform/environments/dev
+        working-directory: terraform/environments/staging
         run: terraform init
 
       - name: Terraform Plan
-        working-directory: terraform/environments/dev
+        working-directory: terraform/environments/staging
         run: terraform plan -out=tfplan
 
       - name: Terraform Apply
-        working-directory: terraform/environments/dev
+        working-directory: terraform/environments/staging
         run: terraform apply -auto-approve tfplan
 
       - name: Output Infrastructure Details
-        working-directory: terraform/environments/dev
+        working-directory: terraform/environments/staging
         run: |
-          echo "## Development Infrastructure Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "## Staging Infrastructure Deployed" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           terraform output -json | jq -r 'to_entries[] | "- **\(.key)**: \(.value.value)"' >> $GITHUB_STEP_SUMMARY
 
+      - name: Run Post-Deployment Tests
+        run: |
+          echo "Running post-deployment validation tests..."
+          # Add your test commands here
+          
       - name: Notify on Failure
         if: failure()
         uses: actions/github-script@v7
@@ -62,7 +68,7 @@ jobs:
             github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: 'Terraform Apply Failed - Dev Environment',
-              body: `The Terraform apply to development failed. Please check the logs: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-              labels: ['infrastructure', 'dev', 'failed-deployment']
+              title: 'Terraform Apply Failed - Staging Environment',
+              body: `The Terraform apply to staging failed. Please check the logs: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              labels: ['infrastructure', 'staging', 'failed-deployment']
             });
