@@ -37,15 +37,27 @@ provider "azuread" {}
 
 # Data sources
 data "azurerm_client_config" "current" {}
-
 data "azuread_client_config" "current" {}
 
 # Local variables
 locals {
-  environment         = "prod"
-  location            = var.location
-  location_short      = var.location_short
-  project_name        = var.project_name
+  environment    = "prod"
+  project_name   = var.project_name
+  
+  # Define regions for deployment
+  regions = {
+    primary = {
+      location       = var.primary_region
+      location_short = var.primary_region_short
+      priority       = 1
+    }
+    secondary = {
+      location       = var.secondary_region
+      location_short = var.secondary_region_short
+      priority       = 2
+    }
+  }
+  
   common_tags = {
     Environment        = local.environment
     Project           = local.project_name
@@ -54,193 +66,132 @@ locals {
     DataClassification = "HealthData"
     CostCenter        = var.cost_center
   }
-  
-  # Naming convention: {resource-type}-{project}-{environment}-{region}-{instance}
-  resource_group_name = "rg-${local.project_name}-${local.environment}-${local.location_short}-001"
 }
 
-# Resource Group
-resource "azurerm_resource_group" "main" {
-  name     = local.resource_group_name
-  location = local.location
+# Global Resource Group for Traffic Manager
+resource "azurerm_resource_group" "global" {
+  name     = "rg-${local.project_name}-${local.environment}-global-001"
+  location = local.regions.primary.location
   tags     = local.common_tags
 }
 
-# Networking Module
-module "networking" {
-  source = "../../modules/networking"
+# Deploy Regional Infrastructure
+module "region" {
+  source   = "../../modules/regional-deployment"
+  for_each = local.regions
   
-  resource_group_name = azurerm_resource_group.main.name
-  location           = azurerm_resource_group.main.location
   environment        = local.environment
   project_name       = local.project_name
-  location_short     = local.location_short
+  location           = each.value.location
+  location_short     = each.value.location_short
+  region_name        = each.key
   tags               = local.common_tags
   
-  vnet_address_space           = var.vnet_address_space
-  subnet_function_address      = var.subnet_function_address
-  subnet_container_address     = var.subnet_container_address
-  subnet_private_endpoint_address = var.subnet_private_endpoint_address
-  subnet_gateway_address       = var.subnet_gateway_address
+  # Networking
+  vnet_address_space              = var.regional_vnet_address_spaces[each.key]
+  subnet_app_service_address      = var.regional_subnet_app_service[each.key]
+  subnet_private_endpoint_address = var.regional_subnet_private_endpoint[each.key]
+  subnet_gateway_address          = var.regional_subnet_gateway[each.key]
   
-  enable_ddos_protection = var.enable_ddos_protection
+  # App Service
+  app_service_sku_name            = var.app_service_sku_name
+  availability_zones              = var.availability_zones
+  app_service_settings            = var.app_service_settings
+  
+  # Security
+  key_vault_admin_object_ids = var.key_vault_admin_object_ids
+  
+  # Monitoring
+  log_retention_days     = var.log_retention_days
+  alert_email_addresses  = var.alert_email_addresses
+  
+  # Global resources for linking
+  global_resource_group_name = azurerm_resource_group.global.name
 }
 
-# Security Module
-module "security" {
-  source = "../../modules/security"
+# Traffic Manager for Cross-Region Load Balancing
+module "traffic_manager" {
+  source = "../../modules/traffic-manager"
   
-  resource_group_name = azurerm_resource_group.main.name
-  location           = azurerm_resource_group.main.location
-  environment        = local.environment
-  project_name       = local.project_name
-  location_short     = local.location_short
-  tags               = local.common_tags
+  environment              = local.environment
+  project_name             = local.project_name
+  resource_group_name      = azurerm_resource_group.global.name
+  tags                     = local.common_tags
   
-  tenant_id                    = data.azurerm_client_config.current.tenant_id
-  private_endpoint_subnet_id   = module.networking.private_endpoint_subnet_id
-  vnet_id                      = module.networking.vnet_id
+  # Regional endpoints
+  regional_endpoints = {
+    for region_key, region in module.region : region_key => {
+      target_resource_id = region.app_gateway_public_ip_id
+      priority           = local.regions[region_key].priority
+      location           = local.regions[region_key].location
+    }
+  }
   
-  key_vault_admin_object_ids   = var.key_vault_admin_object_ids
-  log_analytics_workspace_id   = module.monitoring.log_analytics_workspace_id
+  traffic_routing_method = var.traffic_routing_method
+  monitor_protocol       = var.traffic_manager_monitor_protocol
+  monitor_port           = var.traffic_manager_monitor_port
+  monitor_path           = var.traffic_manager_monitor_path
 }
 
-# Monitoring Module
-module "monitoring" {
-  source = "../../modules/monitoring"
+# Global Monitoring Dashboard
+resource "azurerm_portal_dashboard" "global" {
+  name                = "dash-${local.project_name}-${local.environment}-global"
+  resource_group_name = azurerm_resource_group.global.name
+  location            = azurerm_resource_group.global.location
+  tags                = local.common_tags
   
-  resource_group_name = azurerm_resource_group.main.name
-  location           = azurerm_resource_group.main.location
-  environment        = local.environment
-  project_name       = local.project_name
-  location_short     = local.location_short
-  tags               = local.common_tags
-  
-  retention_in_days = var.log_retention_days
-  alert_email_addresses = var.alert_email_addresses
-}
-
-# Storage Module (for Function App and general storage needs)
-module "storage" {
-  source = "../../modules/storage"
-  
-  resource_group_name = azurerm_resource_group.main.name
-  location           = azurerm_resource_group.main.location
-  environment        = local.environment
-  project_name       = local.project_name
-  location_short     = local.location_short
-  tags               = local.common_tags
-  
-  private_endpoint_subnet_id = module.networking.private_endpoint_subnet_id
-  vnet_id                    = module.networking.vnet_id
-  log_analytics_workspace_id = module.monitoring.log_analytics_workspace_id
-}
-
-# Azure Functions Module
-module "azure_functions" {
-  source = "../../modules/azure-functions"
-  
-  resource_group_name = azurerm_resource_group.main.name
-  location           = azurerm_resource_group.main.location
-  environment        = local.environment
-  project_name       = local.project_name
-  location_short     = local.location_short
-  tags               = local.common_tags
-  
-  function_subnet_id              = module.networking.function_subnet_id
-  storage_account_name            = module.storage.function_storage_account_name
-  storage_account_primary_access_key = module.storage.function_storage_primary_access_key
-  application_insights_connection_string = module.monitoring.application_insights_connection_string
-  key_vault_id                    = module.security.key_vault_id
-  log_analytics_workspace_id      = module.monitoring.log_analytics_workspace_id
-  
-  function_app_settings = var.function_app_settings
-  function_app_sku      = var.function_app_sku
-}
-
-# Container Apps Module (optional - can be enabled/disabled)
-module "container_apps" {
-  source = "../../modules/container-apps"
-  count  = var.enable_container_apps ? 1 : 0
-  
-  resource_group_name = azurerm_resource_group.main.name
-  location           = azurerm_resource_group.main.location
-  environment        = local.environment
-  project_name       = local.project_name
-  location_short     = local.location_short
-  tags               = local.common_tags
-  
-  container_subnet_id                     = module.networking.container_subnet_id
-  log_analytics_workspace_id              = module.monitoring.log_analytics_workspace_id
-  application_insights_connection_string  = module.monitoring.application_insights_connection_string
-  key_vault_id                            = module.security.key_vault_id
-  
-  container_apps = var.container_apps
-}
-
-# Azure Policy Assignments
-module "policy" {
-  source = "../../modules/policy"
-  
-  resource_group_id = azurerm_resource_group.main.id
-  environment       = local.environment
-  location          = local.location
+  dashboard_properties = templatefile("${path.module}/dashboard.tpl.json", {
+    primary_app_insights_id   = module.region["primary"].application_insights_id
+    secondary_app_insights_id = module.region["secondary"].application_insights_id
+    traffic_manager_id        = module.traffic_manager.traffic_manager_profile_id
+  })
 }
 
 # Outputs
-output "resource_group_name" {
-  value       = azurerm_resource_group.main.name
-  description = "The name of the resource group"
+output "traffic_manager_fqdn" {
+  value       = module.traffic_manager.traffic_manager_fqdn
+  description = "The FQDN of the Traffic Manager profile - use this as your application endpoint"
 }
 
-output "vnet_id" {
-  value       = module.networking.vnet_id
-  description = "The ID of the virtual network"
+output "primary_region" {
+  value = {
+    resource_group_name       = module.region["primary"].resource_group_name
+    app_service_name          = module.region["primary"].app_service_name
+    app_service_default_hostname = module.region["primary"].app_service_default_hostname
+    app_gateway_public_ip     = module.region["primary"].app_gateway_public_ip_address
+    key_vault_name            = module.region["primary"].key_vault_name
+  }
+  description = "Primary region infrastructure outputs"
 }
 
-output "key_vault_name" {
-  value       = module.security.key_vault_name
-  description = "The name of the Key Vault"
+output "secondary_region" {
+  value = {
+    resource_group_name       = module.region["secondary"].resource_group_name
+    app_service_name          = module.region["secondary"].app_service_name
+    app_service_default_hostname = module.region["secondary"].app_service_default_hostname
+    app_gateway_public_ip     = module.region["secondary"].app_gateway_public_ip_address
+    key_vault_name            = module.region["secondary"].key_vault_name
+  }
+  description = "Secondary region infrastructure outputs"
 }
 
-output "key_vault_uri" {
-  value       = module.security.key_vault_uri
-  description = "The URI of the Key Vault"
+output "deployment_endpoints" {
+  value = {
+    for region_key, region in module.region : region_key => {
+      app_service_name = region.app_service_name
+      deployment_url   = "https://${region.app_service_default_hostname}"
+    }
+  }
+  description = "App Service names and URLs for each region for deployment"
 }
 
-output "function_app_name" {
-  value       = module.azure_functions.function_app_name
-  description = "The name of the Function App"
-}
-
-output "function_app_default_hostname" {
-  value       = module.azure_functions.function_app_default_hostname
-  description = "The default hostname of the Function App"
-}
-
-output "function_app_identity_principal_id" {
-  value       = module.azure_functions.function_app_identity_principal_id
-  description = "The principal ID of the Function App managed identity"
-}
-
-output "container_app_fqdns" {
-  value       = var.enable_container_apps ? module.container_apps[0].container_app_fqdns : {}
-  description = "The FQDNs of the Container Apps"
-}
-
-output "application_insights_instrumentation_key" {
-  value       = module.monitoring.application_insights_instrumentation_key
-  description = "Application Insights instrumentation key"
+output "application_insights" {
+  value = {
+    for region_key, region in module.region : region_key => {
+      instrumentation_key = region.application_insights_instrumentation_key
+      connection_string   = region.application_insights_connection_string
+    }
+  }
   sensitive   = true
-}
-
-output "application_insights_connection_string" {
-  value       = module.monitoring.application_insights_connection_string
-  description = "Application Insights connection string"
-  sensitive   = true
-}
-
-output "log_analytics_workspace_id" {
-  value       = module.monitoring.log_analytics_workspace_id
-  description = "The ID of the Log Analytics workspace"
+  description = "Application Insights details per region"
 }
