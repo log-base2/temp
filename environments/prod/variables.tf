@@ -1,15 +1,3 @@
-variable "location" {
-  description = "Azure region for resources"
-  type        = string
-  default     = "uksouth"
-}
-
-variable "location_short" {
-  description = "Short name for Azure region"
-  type        = string
-  default     = "uks"
-}
-
 variable "project_name" {
   description = "Project name used in resource naming"
   type        = string
@@ -20,41 +8,110 @@ variable "cost_center" {
   type        = string
 }
 
-# Networking variables
-variable "vnet_address_space" {
-  description = "Address space for the virtual network"
-  type        = list(string)
-  default     = ["10.0.0.0/16"]
+# Regional Configuration
+variable "primary_region" {
+  description = "Primary Azure region"
+  type        = string
+  default     = "uksouth"
 }
 
-variable "subnet_function_address" {
-  description = "Address prefix for Function App subnet"
-  type        = list(string)
-  default     = ["10.0.1.0/24"]
+variable "primary_region_short" {
+  description = "Short name for primary region"
+  type        = string
+  default     = "uks"
 }
 
-variable "subnet_container_address" {
-  description = "Address prefix for Container Apps subnet"
-  type        = list(string)
-  default     = ["10.0.2.0/23"]
+variable "secondary_region" {
+  description = "Secondary Azure region"
+  type        = string
+  default     = "ukwest"
 }
 
-variable "subnet_private_endpoint_address" {
-  description = "Address prefix for Private Endpoint subnet"
-  type        = list(string)
-  default     = ["10.0.4.0/24"]
+variable "secondary_region_short" {
+  description = "Short name for secondary region"
+  type        = string
+  default     = "ukw"
 }
 
-variable "subnet_gateway_address" {
-  description = "Address prefix for Gateway subnet"
-  type        = list(string)
-  default     = ["10.0.5.0/24"]
+# Networking variables per region
+variable "regional_vnet_address_spaces" {
+  description = "Address spaces for VNets in each region"
+  type        = map(list(string))
+  default = {
+    primary   = ["10.0.0.0/16"]
+    secondary = ["10.10.0.0/16"]
+  }
 }
 
-variable "enable_ddos_protection" {
-  description = "Enable DDoS Protection Standard"
-  type        = bool
-  default     = true
+variable "regional_subnet_app_service" {
+  description = "Address prefix for App Service subnet per region"
+  type        = map(list(string))
+  default = {
+    primary   = ["10.0.1.0/24"]
+    secondary = ["10.10.1.0/24"]
+  }
+}
+
+variable "regional_subnet_private_endpoint" {
+  description = "Address prefix for Private Endpoint subnet per region"
+  type        = map(list(string))
+  default = {
+    primary   = ["10.0.2.0/24"]
+    secondary = ["10.10.2.0/24"]
+  }
+}
+
+variable "regional_subnet_gateway" {
+  description = "Address prefix for Application Gateway subnet per region"
+  type        = map(list(string))
+  default = {
+    primary   = ["10.0.3.0/24"]
+    secondary = ["10.10.3.0/24"]
+  }
+}
+
+# App Service Configuration
+variable "app_service_sku_name" {
+  description = "SKU for App Service Plan (P1v3, P2v3, P3v3 for zone redundancy)"
+  type        = string
+  default     = "P1v3"
+}
+
+variable "availability_zones" {
+  description = "Availability zones for App Service (must use Premium v3 SKU)"
+  type        = list(string)
+  default     = ["1", "2", "3"]
+}
+
+variable "app_service_settings" {
+  description = "Application settings for App Service"
+  type        = map(string)
+  default     = {}
+}
+
+# Traffic Manager Configuration
+variable "traffic_routing_method" {
+  description = "Traffic Manager routing method (Performance, Priority, Weighted, Geographic)"
+  type        = string
+  default     = "Performance"
+}
+
+variable "traffic_manager_monitor_protocol" {
+  description = "Protocol for Traffic Manager health checks"
+  type        = string
+  default     = "HTTPS"
+}
+
+variable "traffic_manager_monitor_port" {
+  description = "Port for Traffic Manager health checks"
+  type        = number
+  default     = 443
+}
+
+variable "traffic_manager_monitor_path" {
+  description = "Path for Traffic Manager health checks"
+  type        = string
+  default     = "/health"
 }
 
 # Security variables
@@ -73,38 +130,4 @@ variable "log_retention_days" {
 variable "alert_email_addresses" {
   description = "Email addresses for alert notifications"
   type        = list(string)
-}
-
-# Function App variables
-variable "function_app_sku" {
-  description = "SKU for Function App (EP1, EP2, EP3 for Premium, or P1v2, P2v2, P3v2 for Dedicated)"
-  type        = string
-  default     = "EP1"
-}
-
-variable "function_app_settings" {
-  description = "Additional app settings for Function App"
-  type        = map(string)
-  default     = {}
-}
-
-# Container Apps variables
-variable "enable_container_apps" {
-  description = "Enable Container Apps deployment"
-  type        = bool
-  default     = false
-}
-
-variable "container_apps" {
-  description = "Map of container apps to deploy"
-  type = map(object({
-    container_image = string
-    container_port  = number
-    cpu             = number
-    memory          = string
-    min_replicas    = number
-    max_replicas    = number
-    env_vars        = map(string)
-  }))
-  default = {}
 }
