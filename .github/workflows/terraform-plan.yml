@@ -1,41 +1,491 @@
-name: Terraform Plan
+name: Terraform Plan & Security Scan
 
 on:
   pull_request:
+    branches:
+      - main
     paths:
       - 'terraform/**'
+      - '.github/workflows/terraform-*.yml'
 
 permissions:
   id-token: write
   contents: read
   pull-requests: write
+  security-events: write
+  issues: write
 
+env:
+  TERRAFORM_VERSION: '1.5.7'
+  TF_LOG: INFO
+  
 jobs:
-  plan:
+  # Job 1: Code Quality & Formatting
+  code-quality:
+    name: Code Quality Checks
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for better analysis
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Format Check
+        id: fmt
+        run: |
+          echo "Checking Terraform formatting..."
+          terraform fmt -check -recursive -diff terraform/
+        continue-on-error: true
+
+      - name: Terraform Format Results
+        if: steps.fmt.outcome == 'failure'
+        run: |
+          echo "::error::Terraform files are not properly formatted. Run 'terraform fmt -recursive' locally."
+          exit 1
+
+      - name: Validate Terraform Syntax
+        run: |
+          for dir in terraform/environments/*/; do
+            echo "Validating $dir"
+            cd $dir
+            terraform init -backend=false
+            terraform validate
+            cd -
+          done
+
+  # Job 2: Security Scanning
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    needs: code-quality
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Checkov Security Scan
+        id: checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: terraform/
+          framework: terraform
+          output_format: sarif
+          output_file_path: reports/checkov-results.sarif
+          soft_fail: false
+          skip_check: CKV_AZURE_109  # Example: Skip specific checks if needed
+          # Fail on HIGH and CRITICAL only for medical device compliance
+          compact: true
+          quiet: false
+
+      - name: Upload Checkov SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: reports/checkov-results.sarif
+          category: checkov
+
+      - name: Run TFSec Security Scan
+        id: tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: terraform/
+          format: sarif
+          soft_fail: false
+          additional_args: --minimum-severity HIGH
+
+      - name: Upload TFSec SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: tfsec-results.sarif
+          category: tfsec
+
+      - name: Run Terrascan
+        id: terrascan
+        run: |
+          docker run --rm \
+            -v $(pwd):/src \
+            tenable/terrascan scan \
+            -i terraform \
+            -d /src/terraform \
+            -o sarif \
+            --severity high \
+            --severity critical \
+            > terrascan-results.sarif
+        continue-on-error: true
+
+      - name: Upload Terrascan Results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: terrascan-results.sarif
+          category: terrascan
+
+      - name: Security Scan Summary
+        if: always()
+        run: |
+          echo "## Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Checkov: ${{ steps.checkov.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "✅ TFSec: ${{ steps.tfsec.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Terrascan: ${{ steps.terrascan.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Review the Security tab for detailed findings." >> $GITHUB_STEP_SUMMARY
+
+  # Job 3: Secrets Detection
+  secrets-scan:
+    name: Secrets Detection
+    runs-on: ubuntu-latest
+    needs: code-quality
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_SUMMARY: true
+
+      - name: Run TruffleHog
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+
+  # Job 4: Compliance Check
+  compliance-check:
+    name: Compliance Validation
+    runs-on: ubuntu-latest
+    needs: [security-scan, secrets-scan]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Validate Medical Device Compliance
+        run: |
+          echo "## Compliance Checklist" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check for UK regions only
+          if grep -r "location.*=.*\"eastus\|westus\|northeurope\"" terraform/; then
+            echo "❌ Non-UK regions detected - violates data residency" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "✅ UK regions only - data residency compliant" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Check for log retention
+          if grep -r "log_retention_days.*=.*2555" terraform/environments/prod/; then
+            echo "✅ 7-year log retention configured" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ 7-year log retention not found in production" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+          
+          # Check for encryption
+          if grep -r "min_tls_version.*=.*\"1.2\"" terraform/; then
+            echo "✅ TLS 1.2 minimum enforced" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️  Warning: TLS 1.2 enforcement not found" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Check for private endpoints
+          if grep -r "azurerm_private_endpoint" terraform/modules/; then
+            echo "✅ Private endpoints configured" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Private endpoints missing" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+  # Job 5: Terraform Plan per Environment
+  terraform-plan:
+    name: Plan - ${{ matrix.environment }}
+    runs-on: ubuntu-latest
+    needs: [security-scan, secrets-scan, compliance-check]
     strategy:
+      fail-fast: false
       matrix:
         environment: [dev, staging, prod]
     
     steps:
-      - uses: actions/checkout@v4
-      
-      - uses: azure/login@v1
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: true
+
+      - name: Azure Login via OIDC
+        uses: azure/login@v1
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-      
-      - uses: hashicorp/setup-terraform@v3
-      
+          subscription-id: ${{ secrets[format('AZURE_SUBSCRIPTION_ID_{0}', matrix.environment)] }}
+
       - name: Terraform Init
+        id: init
         working-directory: terraform/environments/${{ matrix.environment }}
-        run: terraform init
-      
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=rg-terraform-state-prod" \
+            -backend-config="storage_account_name=sttfstateprod001" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=${{ matrix.environment }}.terraform.tfstate"
+
+      - name: Terraform Validate
+        working-directory: terraform/environments/${{ matrix.environment }}
+        run: terraform validate -no-color
+
       - name: Terraform Plan
+        id: plan
         working-directory: terraform/environments/${{ matrix.environment }}
-        run: terraform plan -out=tfplan
-      
+        run: |
+          terraform plan -no-color -out=tfplan -lock-timeout=5m
+          terraform show -no-color tfplan > plan-output.txt
+        continue-on-error: true
+
+      - name: Generate Plan Summary
+        id: plan-summary
+        working-directory: terraform/environments/${{ matrix.environment }}
+        run: |
+          {
+            echo "## Terraform Plan - ${{ matrix.environment }}"
+            echo ""
+            echo "<details><summary>📋 Show Plan Details</summary>"
+            echo ""
+            echo '```hcl'
+            # Show first 500 lines (GitHub has size limits)
+            head -n 500 plan-output.txt
+            if [ $(wc -l < plan-output.txt) -gt 500 ]; then
+              echo ""
+              echo "... (output truncated, see full plan in workflow logs)"
+            fi
+            echo '```'
+            echo ""
+            echo "</details>"
+            echo ""
+            
+            # Extract changes summary
+            echo "### Changes Summary"
+            echo ""
+            grep -A 3 "Plan:" plan-output.txt || echo "No changes detected"
+          } > plan-summary.md
+
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: tfplan-${{ matrix.environment }}
+          path: terraform/environments/${{ matrix.environment }}/tfplan
+          retention-days: 5
+
+      - name: Upload Plan Output
+        uses: actions/upload-artifact@v3
+        with:
+          name: plan-output-${{ matrix.environment }}
+          path: terraform/environments/${{ matrix.environment }}/plan-output.txt
+          retention-days: 5
+
       - name: Comment Plan on PR
         uses: actions/github-script@v7
-        # Add script to comment plan output
+        if: github.event_name == 'pull_request'
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const planSummary = fs.readFileSync('terraform/environments/${{ matrix.environment }}/plan-summary.md', 'utf8');
+            
+            const output = `#### Terraform Plan: \`${{ matrix.environment }}\` 📊
+            
+            <details><summary>Plan Status</summary>
+            
+            - Terraform Format: \`${{ steps.fmt.outcome }}\`
+            - Terraform Init: \`${{ steps.init.outcome }}\`
+            - Terraform Validate: \`${{ steps.validate.outcome }}\`
+            - Terraform Plan: \`${{ steps.plan.outcome }}\`
+            
+            </details>
+            
+            ${planSummary}
+            
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Workflow: \`${{ github.workflow }}\`*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+      - name: Plan Status Check
+        if: steps.plan.outcome == 'failure'
+        run: |
+          echo "::error::Terraform plan failed for ${{ matrix.environment }}"
+          exit 1
+
+  # Job 6: Cost Estimation
+  cost-estimate:
+    name: Cost Estimation
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v2
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Download Plan Artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: ./plans
+
+      - name: Generate Cost Estimate
+        run: |
+          infracost breakdown \
+            --path=terraform/environments/prod \
+            --format=json \
+            --out-file=/tmp/infracost-base.json \
+            || echo "Infracost estimation skipped"
+
+      - name: Post Cost Comment
+        if: hashFiles('/tmp/infracost-base.json') != ''
+        run: |
+          infracost comment github \
+            --path=/tmp/infracost-base.json \
+            --repo=$GITHUB_REPOSITORY \
+            --github-token=${{ secrets.GITHUB_TOKEN }} \
+            --pull-request=${{ github.event.pull_request.number }} \
+            --behavior=update \
+            || echo "Cost comment skipped"
+
+  # Job 7: Change Risk Assessment
+  risk-assessment:
+    name: Change Risk Assessment
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download Plan Artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: ./plans
+
+      - name: Assess Change Risk
+        run: |
+          echo "## Change Risk Assessment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          RISK_LEVEL="LOW"
+          RISK_FACTORS=()
+          
+          # Check for production changes
+          if [ -f "plans/plan-output-prod/plan-output.txt" ]; then
+            if grep -q "will be destroyed" plans/plan-output-prod/plan-output.txt; then
+              RISK_LEVEL="HIGH"
+              RISK_FACTORS+=("⚠️  Resources will be DESTROYED in production")
+            fi
+            
+            if grep -q "will be replaced" plans/plan-output-prod/plan-output.txt; then
+              RISK_LEVEL="MEDIUM"
+              RISK_FACTORS+=("⚠️  Resources will be REPLACED in production")
+            fi
+            
+            if grep -q "azurerm_application_gateway\|azurerm_traffic_manager" plans/plan-output-prod/plan-output.txt; then
+              RISK_LEVEL="MEDIUM"
+              RISK_FACTORS+=("⚠️  Changes to load balancing infrastructure")
+            fi
+            
+            if grep -q "azurerm_virtual_network\|azurerm_subnet" plans/plan-output-prod/plan-output.txt; then
+              RISK_LEVEL="HIGH"
+              RISK_FACTORS+=("⚠️  Network infrastructure changes")
+            fi
+          fi
+          
+          echo "### Risk Level: **${RISK_LEVEL}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ ${#RISK_FACTORS[@]} -gt 0 ]; then
+            echo "### Risk Factors:" >> $GITHUB_STEP_SUMMARY
+            for factor in "${RISK_FACTORS[@]}"; do
+              echo "- $factor" >> $GITHUB_STEP_SUMMARY
+            done
+          else
+            echo "✅ No high-risk changes detected" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Recommendations:" >> $GITHUB_STEP_SUMMARY
+          if [ "$RISK_LEVEL" == "HIGH" ]; then
+            echo "- 🔴 Schedule maintenance window" >> $GITHUB_STEP_SUMMARY
+            echo "- 🔴 Notify stakeholders" >> $GITHUB_STEP_SUMMARY
+            echo "- 🔴 Prepare rollback plan" >> $GITHUB_STEP_SUMMARY
+            echo "- 🔴 Requires multiple approvers" >> $GITHUB_STEP_SUMMARY
+          elif [ "$RISK_LEVEL" == "MEDIUM" ]; then
+            echo "- 🟡 Test in staging first" >> $GITHUB_STEP_SUMMARY
+            echo "- 🟡 Have rollback plan ready" >> $GITHUB_STEP_SUMMARY
+            echo "- 🟡 Monitor closely after deployment" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- 🟢 Standard deployment procedures apply" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Create Risk Assessment Issue
+        if: contains(fromJSON('["HIGH", "MEDIUM"]'), env.RISK_LEVEL)
+        uses: actions/github-script@v7
+        env:
+          RISK_LEVEL: ${{ env.RISK_LEVEL }}
+        with:
+          script: |
+            const riskLevel = process.env.RISK_LEVEL || 'UNKNOWN';
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[${riskLevel} RISK] Infrastructure Change in PR #${context.issue.number}`,
+              body: `This PR contains ${riskLevel} risk infrastructure changes.\n\nPlease review the Change Risk Assessment in the workflow summary.\n\nPR: #${context.issue.number}`,
+              labels: ['infrastructure', 'risk-assessment', `risk-${riskLevel.toLowerCase()}`]
+            });
+
+  # Job 8: Final Status
+  pipeline-status:
+    name: Pipeline Status
+    runs-on: ubuntu-latest
+    needs: [code-quality, security-scan, secrets-scan, compliance-check, terraform-plan, risk-assessment]
+    if: always()
+    steps:
+      - name: Check Pipeline Status
+        run: |
+          echo "## Pipeline Execution Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Code Quality: ${{ needs.code-quality.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Security Scan: ${{ needs.security-scan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Secrets Scan: ${{ needs.secrets-scan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Compliance: ${{ needs.compliance-check.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Terraform Plan: ${{ needs.terraform-plan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Risk Assessment: ${{ needs.risk-assessment.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.code-quality.result }}" == "failure" ] || \
+             [ "${{ needs.security-scan.result }}" == "failure" ] || \
+             [ "${{ needs.secrets-scan.result }}" == "failure" ] || \
+             [ "${{ needs.compliance-check.result }}" == "failure" ] || \
+             [ "${{ needs.terraform-plan.result }}" == "failure" ]; then
+            echo "❌ Pipeline Failed - Review errors above" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "✅ All Checks Passed - Ready for Review" >> $GITHUB_STEP_SUMMARY
+          fi

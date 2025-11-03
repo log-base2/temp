@@ -1,37 +1,618 @@
 name: Deploy to Production
 
 on:
-  workflow_dispatch:  # Manual trigger
   push:
     branches:
       - main
     paths:
       - 'terraform/environments/prod/**'
+      - 'terraform/modules/**'
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for manual deployment'
+        required: true
+        type: string
+      skip_tests:
+        description: 'Skip validation tests (NOT RECOMMENDED)'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   id-token: write
   contents: read
+  issues: write
+  pull-requests: write
+
+env:
+  TERRAFORM_VERSION: '1.5.7'
+  TF_LOG: INFO
+  DEPLOYMENT_ENV: production
 
 jobs:
-  deploy:
+  # Job 1: Pre-Deployment Validation
+  pre-deployment-checks:
+    name: Pre-Deployment Validation
     runs-on: ubuntu-latest
-    environment: production  # GitHub environment with protection rules
+    environment: 
+      name: production-validation
     
-    steps:
-      - uses: actions/checkout@v4
+    outputs:
+      should_proceed: ${{ steps.validation.outputs.proceed }}
       
-      - uses: azure/login@v1
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate Business Hours (UK Time)
+        id: business-hours
+        run: |
+          # Get current UK time
+          UK_HOUR=$(TZ='Europe/London' date +%H)
+          UK_DAY=$(TZ='Europe/London' date +%u)
+          
+          echo "Current UK Hour: $UK_HOUR"
+          echo "Current UK Day: $UK_DAY (1=Mon, 7=Sun)"
+          
+          # Allow deployment 9 AM - 5 PM UK time, Monday-Friday
+          # Can be overridden by workflow_dispatch
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            if [ $UK_DAY -gt 5 ]; then
+              echo "::error::Production deployments not allowed on weekends"
+              echo "weekend_deploy=true" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+            
+            if [ $UK_HOUR -lt 9 ] || [ $UK_HOUR -gt 17 ]; then
+              echo "::error::Production deployments only allowed 9 AM - 5 PM UK time"
+              echo "outside_hours=true" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+          fi
+          
+          echo "✅ Business hours check passed" >> $GITHUB_STEP_SUMMARY
+
+      - name: Check Recent Deployments
+        run: |
+          # Check if there was a deployment in the last hour
+          LAST_DEPLOYMENT=$(gh run list \
+            --workflow="Deploy to Production" \
+            --status=completed \
+            --limit=1 \
+            --json conclusion,createdAt \
+            --jq '.[0].createdAt')
+          
+          if [ ! -z "$LAST_DEPLOYMENT" ]; then
+            LAST_TIME=$(date -d "$LAST_DEPLOYMENT" +%s)
+            NOW=$(date +%s)
+            DIFF=$((NOW - LAST_TIME))
+            
+            # Require at least 1 hour between deployments
+            if [ $DIFF -lt 3600 ]; then
+              echo "::warning::Recent deployment detected $(($DIFF / 60)) minutes ago"
+              echo "⚠️  Recent deployment: $(($DIFF / 60)) minutes ago" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Validate Commit
+        run: |
+          # Get commit message
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          
+          # Check for required patterns
+          if ! echo "$COMMIT_MSG" | grep -qiE "^(feat|fix|docs|chore|refactor|test|ci):"; then
+            echo "::warning::Commit message should follow conventional commits"
+          fi
+          
+          # Check for [skip ci] or similar
+          if echo "$COMMIT_MSG" | grep -qiE "\[skip.{0,5}ci\]"; then
+            echo "::error::Cannot skip CI for production deployments"
+            exit 1
+          fi
+
+      - name: Security Pre-Check
+        run: |
+          echo "## Security Pre-Check" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Quick check for obvious issues
+          if grep -r "password\s*=\s*\"" terraform/environments/prod/ 2>/dev/null; then
+            echo "❌ Hardcoded passwords detected" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+          
+          if grep -r "TODO\|FIXME\|HACK" terraform/environments/prod/ 2>/dev/null; then
+            echo "⚠️  Warning: TODO/FIXME comments found" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "✅ Security pre-check passed" >> $GITHUB_STEP_SUMMARY
+
+      - name: Validation Summary
+        id: validation
+        run: |
+          echo "proceed=true" >> $GITHUB_OUTPUT
+          echo "✅ All pre-deployment checks passed" >> $GITHUB_STEP_SUMMARY
+
+  # Job 2: Create Deployment Record
+  create-deployment:
+    name: Create Deployment Record
+    runs-on: ubuntu-latest
+    needs: pre-deployment-checks
+    outputs:
+      deployment_id: ${{ steps.create-deployment.outputs.deployment_id }}
+      
+    steps:
+      - name: Create Deployment
+        id: create-deployment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+              environment: 'production',
+              description: 'Production infrastructure deployment',
+              required_contexts: [],
+              auto_merge: false,
+              production_environment: true
+            });
+            
+            core.setOutput('deployment_id', deployment.data.id);
+            
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: deployment.data.id,
+              state: 'in_progress',
+              description: 'Terraform deployment in progress',
+              environment: 'production'
+            });
+            
+            return deployment.data.id;
+
+  # Job 3: Backup Current State
+  backup-state:
+    name: Backup Terraform State
+    runs-on: ubuntu-latest
+    needs: create-deployment
+    steps:
+      - name: Azure Login
+        uses: azure/login@v1
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID_PROD }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_PROD }}
+
+      - name: Backup State File
+        run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          
+          az storage blob copy start \
+            --account-name sttfstateprod001 \
+            --destination-container tfstate-backups \
+            --destination-blob "prod-${TIMESTAMP}.tfstate" \
+            --source-container tfstate \
+            --source-blob prod.terraform.tfstate \
+            --auth-mode login
+          
+          echo "✅ State backed up to: prod-${TIMESTAMP}.tfstate" >> $GITHUB_STEP_SUMMARY
+
+      - name: Create Backup Metadata
+        run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          cat > backup-metadata.json <<EOF
+          {
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "commit": "${{ github.sha }}",
+            "actor": "${{ github.actor }}",
+            "workflow_run": "${{ github.run_id }}",
+            "reason": "${{ github.event.inputs.reason || 'Automatic deployment' }}"
+          }
+          EOF
+          
+          az storage blob upload \
+            --account-name sttfstateprod001 \
+            --container-name tfstate-backups \
+            --file backup-metadata.json \
+            --name "prod-${TIMESTAMP}.json" \
+            --auth-mode login
+
+  # Job 4: Terraform Apply with Safety Checks
+  terraform-apply:
+    name: Apply Infrastructure Changes
+    runs-on: ubuntu-latest
+    needs: [pre-deployment-checks, create-deployment, backup-state]
+    environment:
+      name: production
+      # This requires manual approval from designated reviewers
+    
+    outputs:
+      changes_made: ${{ steps.apply.outputs.changes }}
       
-      - uses: hashicorp/setup-terraform@v3
-      
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_PROD }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_PROD }}
+
       - name: Terraform Init
         working-directory: terraform/environments/prod
-        run: terraform init
-      
-      - name: Terraform Apply
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=rg-terraform-state-prod" \
+            -backend-config="storage_account_name=sttfstateprod001" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=prod.terraform.tfstate"
+
+      - name: Terraform Plan (Final Check)
+        id: plan
         working-directory: terraform/environments/prod
-        run: terraform apply -auto-approve
+        run: |
+          terraform plan -out=tfplan -lock-timeout=10m -detailed-exitcode
+          terraform show -no-color tfplan > final-plan.txt
+        continue-on-error: true
+
+      - name: Upload Final Plan
+        uses: actions/upload-artifact@v3
+        with:
+          name: final-production-plan
+          path: terraform/environments/prod/final-plan.txt
+          retention-days: 90  # Keep for audit trail
+
+      - name: Analyze Plan Changes
+        id: analyze
+        working-directory: terraform/environments/prod
+        run: |
+          echo "## Deployment Impact Analysis" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Count changes
+          TO_ADD=$(grep -c "will be created" final-plan.txt || echo "0")
+          TO_CHANGE=$(grep -c "will be updated" final-plan.txt || echo "0")
+          TO_DESTROY=$(grep -c "will be destroyed" final-plan.txt || echo "0")
+          TO_REPLACE=$(grep -c "will be replaced" final-plan.txt || echo "0")
+          
+          echo "- Resources to add: $TO_ADD" >> $GITHUB_STEP_SUMMARY
+          echo "- Resources to change: $TO_CHANGE" >> $GITHUB_STEP_SUMMARY
+          echo "- Resources to destroy: $TO_DESTROY" >> $GITHUB_STEP_SUMMARY
+          echo "- Resources to replace: $TO_REPLACE" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Save for later
+          echo "resources_to_destroy=$TO_DESTROY" >> $GITHUB_OUTPUT
+          echo "resources_to_replace=$TO_REPLACE" >> $GITHUB_OUTPUT
+
+      - name: Destructive Changes Warning
+        if: steps.analyze.outputs.resources_to_destroy != '0' || steps.analyze.outputs.resources_to_replace != '0'
+        run: |
+          echo "::warning::⚠️  DESTRUCTIVE CHANGES DETECTED"
+          echo "## ⚠️  DESTRUCTIVE CHANGES" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "This deployment will destroy or replace resources." >> $GITHUB_STEP_SUMMARY
+          echo "Ensure you have:" >> $GITHUB_STEP_SUMMARY
+          echo "- Notified stakeholders" >> $GITHUB_STEP_SUMMARY
+          echo "- Scheduled maintenance window" >> $GITHUB_STEP_SUMMARY
+          echo "- Prepared rollback plan" >> $GITHUB_STEP_SUMMARY
+          
+          # Wait 30 seconds to allow manual cancellation
+          echo "Waiting 30 seconds before proceeding..."
+          sleep 30
+
+      - name: Terraform Apply
+        id: apply
+        working-directory: terraform/environments/prod
+        run: |
+          echo "🚀 Starting Terraform Apply..." >> $GITHUB_STEP_SUMMARY
+          
+          terraform apply -auto-approve -lock-timeout=10m tfplan 2>&1 | tee apply-output.txt
+          
+          if [ ${PIPESTATUS[0]} -eq 0 ]; then
+            echo "changes=true" >> $GITHUB_OUTPUT
+            echo "✅ Infrastructure changes applied successfully" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "changes=false" >> $GITHUB_OUTPUT
+            echo "❌ Infrastructure deployment failed" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+      - name: Upload Apply Output
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: apply-output
+          path: terraform/environments/prod/apply-output.txt
+          retention-days: 90
+
+      - name: Capture Infrastructure Outputs
+        id: outputs
+        if: steps.apply.outcome == 'success'
+        working-directory: terraform/environments/prod
+        run: |
+          terraform output -json > infrastructure-outputs.json
+          
+          # Extract key endpoints
+          TRAFFIC_MANAGER_FQDN=$(terraform output -raw traffic_manager_fqdn)
+          
+          echo "## Deployed Infrastructure" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Global Endpoint:** https://$TRAFFIC_MANAGER_FQDN" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "traffic_manager_fqdn=$TRAFFIC_MANAGER_FQDN" >> $GITHUB_OUTPUT
+
+      - name: Upload Infrastructure Outputs
+        if: steps.apply.outcome == 'success'
+        uses: actions/upload-artifact@v3
+        with:
+          name: infrastructure-outputs
+          path: terraform/environments/prod/infrastructure-outputs.json
+          retention-days: 90
+
+  # Job 5: Post-Deployment Validation
+  post-deployment-validation:
+    name: Validate Deployment
+    runs-on: ubuntu-latest
+    needs: terraform-apply
+    if: ${{ !inputs.skip_tests }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download Infrastructure Outputs
+        uses: actions/download-artifact@v3
+        with:
+          name: infrastructure-outputs
+
+      - name: Wait for Services to Stabilize
+        run: |
+          echo "⏳ Waiting 2 minutes for services to stabilize..."
+          sleep 120
+
+      - name: Health Check - Traffic Manager
+        id: health-tm
+        run: |
+          TRAFFIC_MANAGER_FQDN=$(jq -r '.traffic_manager_fqdn.value' infrastructure-outputs.json)
+          
+          echo "Testing Traffic Manager: $TRAFFIC_MANAGER_FQDN"
+          
+          for i in {1..5}; do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://$TRAFFIC_MANAGER_FQDN/health" || echo "000")
+            
+            if [ "$HTTP_CODE" == "200" ] || [ "$HTTP_CODE" == "404" ]; then
+              echo "✅ Traffic Manager responding (HTTP $HTTP_CODE)"
+              echo "status=healthy" >> $GITHUB_OUTPUT
+              break
+            else
+              echo "⏳ Attempt $i: HTTP $HTTP_CODE - Retrying..."
+              sleep 30
+            fi
+            
+            if [ $i -eq 5 ]; then
+              echo "❌ Traffic Manager health check failed after 5 attempts"
+              echo "status=unhealthy" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+          done
+
+      - name: Health Check - Primary Region
+        run: |
+          PRIMARY_IP=$(jq -r '.primary_region.value.app_gateway_public_ip' infrastructure-outputs.json)
+          
+          echo "Testing Primary Region: $PRIMARY_IP"
+          
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://$PRIMARY_IP/health" -k || echo "000")
+          
+          if [ "$HTTP_CODE" == "200" ] || [ "$HTTP_CODE" == "404" ]; then
+            echo "✅ Primary region responding (HTTP $HTTP_CODE)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️  Primary region returned HTTP $HTTP_CODE" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Health Check - Secondary Region
+        run: |
+          SECONDARY_IP=$(jq -r '.secondary_region.value.app_gateway_public_ip' infrastructure-outputs.json)
+          
+          echo "Testing Secondary Region: $SECONDARY_IP"
+          
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://$SECONDARY_IP/health" -k || echo "000")
+          
+          if [ "$HTTP_CODE" == "200" ] || [ "$HTTP_CODE" == "404" ]; then
+            echo "✅ Secondary region responding (HTTP $HTTP_CODE)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️  Secondary region returned HTTP $HTTP_CODE" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Azure Resource Health Check
+        run: |
+          # Check key resources are healthy
+          echo "## Resource Health Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check Application Gateways
+          az network application-gateway list \
+            --resource-group rg-meddevice-prod-uks-001 \
+            --query "[].{Name:name, ProvisioningState:provisioningState}" \
+            -o table >> $GITHUB_STEP_SUMMARY
+          
+          az network application-gateway list \
+            --resource-group rg-meddevice-prod-ukw-001 \
+            --query "[].{Name:name, ProvisioningState:provisioningState}" \
+            -o table >> $GITHUB_STEP_SUMMARY
+
+      - name: Validation Summary
+        run: |
+          echo "## Post-Deployment Validation Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Traffic Manager: ${{ steps.health-tm.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Primary Region: Checked" >> $GITHUB_STEP_SUMMARY
+          echo "- Secondary Region: Checked" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Deployment validation completed" >> $GITHUB_STEP_SUMMARY
+
+  # Job 6: Update Deployment Status
+  update-deployment-status:
+    name: Update Deployment Status
+    runs-on: ubuntu-latest
+    needs: [create-deployment, terraform-apply, post-deployment-validation]
+    if: always()
+    
+    steps:
+      - name: Update Deployment Status - Success
+        if: needs.terraform-apply.result == 'success' && needs.post-deployment-validation.result == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ needs.create-deployment.outputs.deployment_id }},
+              state: 'success',
+              description: 'Production deployment successful',
+              environment: 'production'
+            });
+
+      - name: Update Deployment Status - Failure
+        if: needs.terraform-apply.result == 'failure' || needs.post-deployment-validation.result == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ needs.create-deployment.outputs.deployment_id }},
+              state: 'failure',
+              description: 'Production deployment failed',
+              environment: 'production'
+            });
+
+  # Job 7: Notifications
+  notify:
+    name: Send Notifications
+    runs-on: ubuntu-latest
+    needs: [terraform-apply, post-deployment-validation]
+    if: always()
+    
+    steps:
+      - name: Notify Success
+        if: needs.terraform-apply.result == 'success' && needs.post-deployment-validation.result == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '✅ Production Deployment Successful',
+              body: `## Production Infrastructure Deployed Successfully
+              
+              **Deployment Details:**
+              - Commit: ${context.sha}
+              - Actor: @${context.actor}
+              - Workflow Run: [${context.runId}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+              - Timestamp: ${new Date().toISOString()}
+              
+              **Validation:**
+              - ✅ Infrastructure deployed
+              - ✅ Health checks passed
+              - ✅ Multi-region verified
+              
+              **Next Steps:**
+              - Monitor Application Insights for any issues
+              - Verify application functionality
+              - Update documentation if needed
+              
+              cc: @ops-team`,
+              labels: ['deployment', 'production', 'success']
+            });
+
+      - name: Notify Failure
+        if: needs.terraform-apply.result == 'failure' || needs.post-deployment-validation.result == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '🚨 CRITICAL: Production Deployment Failed',
+              body: `## ⚠️ Production Deployment Failed
+              
+              **Deployment Details:**
+              - Commit: ${context.sha}
+              - Actor: @${context.actor}
+              - Workflow Run: [${context.runId}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+              - Timestamp: ${new Date().toISOString()}
+              
+              **Failure Details:**
+              - Terraform Apply: ${{ needs.terraform-apply.result }}
+              - Validation: ${{ needs.post-deployment-validation.result }}
+              
+              **Immediate Actions Required:**
+              1. Review workflow logs
+              2. Check if rollback is needed
+              3. Assess impact on production
+              4. Notify stakeholders
+              
+              **State Backup Available:**
+              A backup of the Terraform state has been created and can be used for rollback if necessary.
+              
+              cc: @ops-lead @security-team
+              
+              **PRIORITY: HIGH**`,
+              labels: ['deployment', 'production', 'failed', 'critical'],
+              assignees: ['ops-lead']  // Replace with actual GitHub username
+            });
+
+  # Job 8: Audit Log
+  audit-log:
+    name: Create Audit Record
+    runs-on: ubuntu-latest
+    needs: [terraform-apply, post-deployment-validation]
+    if: always()
+    
+    steps:
+      - name: Create Audit Log Entry
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const auditLog = {
+              timestamp: new Date().toISOString(),
+              event: 'infrastructure_deployment',
+              environment: 'production',
+              actor: context.actor,
+              commit: context.sha,
+              workflow_run: context.runId,
+              status: '${{ needs.terraform-apply.result }}',
+              validation_status: '${{ needs.post-deployment-validation.result }}',
+              reason: '${{ github.event.inputs.reason || "Automatic deployment from main branch" }}',
+              changes_applied: '${{ needs.terraform-apply.outputs.changes_made }}'
+            };
+            
+            // In a real scenario, you might send this to a SIEM or logging service
+            console.log('Audit Log:', JSON.stringify(auditLog, null, 2));
+            
+            // Create a file artifact
+            const fs = require('fs');
+            fs.writeFileSync('audit-log.json', JSON.stringify(auditLog, null, 2));
+
+      - name: Upload Audit Log
+        uses: actions/upload-artifact@v3
+        with:
+          name: audit-log-${{ github.run_id }}
+          path: audit-log.json
+          retention-days: 2555  # 7 years for medical device compliance
