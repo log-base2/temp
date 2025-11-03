@@ -1,0 +1,16 @@
+Summary,Issue Type,Priority,Description,Story Points,Labels,Sprint
+"Design Multi-Region Azure Architecture",Story,Highest,"Create architecture diagrams and documentation for UK South/West regions with 3 availability zones, Application Gateway, and Traffic Manager.",13,"architecture,design",Sprint 1
+"Design DevSecOps Pipeline",Story,Highest,"Design the CI/CD pipeline with security scanning, compliance checks, and multi-stage approvals for dev/staging/prod.",8,"architecture,pipeline",Sprint 1
+"Create Azure Subscriptions and Service Principals",Task,Highest,"Set up Azure subscriptions for dev/staging/prod and create OIDC service principals for GitHub Actions authentication.",5,"setup,azure",Sprint 1
+"Setup Terraform State Storage",Task,Highest,"Create Azure Storage account with versioning, soft delete, and resource locks for Terraform state management.",3,"setup,terraform",Sprint 1
+"Configure GitHub Repository",Task,High,"Set up GitHub repo with branch protection rules, require PR reviews, and enable security scanning features.",2,"setup,github",Sprint 1
+"Create GitHub Environments and Secrets",Task,High,"Configure dev/staging/prod environments with approval gates and add all Azure credential secrets.",3,"setup,github",Sprint 1
+"Create Terraform Project Structure",Task,High,"Set up folder structure for environments (dev/staging/prod) and modules with .gitignore and README.",2,"terraform,setup",Sprint 1
+"Build Networking Module",Story,High,"Create Terraform module for VNet, subnets, NSGs, and private DNS zones with proper security rules.",8,"terraform,networking",Sprint 1
+"Build Security Module",Story,High,"Create Terraform module for Key Vault (Premium with HSM), managed identities, and RBAC role assignments.",8,"terraform,security",Sprint 1
+"Build Monitoring Module",Story,Medium,"Create Terraform module for Log Analytics (7-year retention), Application Insights, and alert rules.",5,"terraform,monitoring",Sprint 1
+"Build App Service Module",Story,High,"Create Terraform module for zone-redundant App Service Plans and App Services with VNet integration.",8,"terraform,compute",Sprint 1
+"Build Application Gateway Module",Story,High,"Create Terraform module for Application Gateway WAF v2 with zone redundancy and health probes.",8,"terraform,networking",Sprint 1
+"Build Pull Request Pipeline",Story,Highest,"Create GitHub Actions workflow with security scanning (Checkov, TFSec, Gitleaks), compliance checks, and Terraform plan.",13,"pipeline,security",Sprint 1
+"Build Production Deployment Pipeline",Story,Highest,"Create GitHub Actions workflow with business hours check, state backup, multi-approver gates, and health validation.",13,"pipeline,deployment",Sprint 1
+"Architecture Sign-off",Task,Highest,"Review and obtain formal approval of architecture design from technical lead, security team, and stakeholders.",3,"sign-off,governance",Sprint 1
